@@ -38,7 +38,7 @@ Set the environment variable DETECTRON2_DATASETS to the parent folder of the dat
 We train our models using four NVIDIA RTX 4090 GPUs.
 
 ```
-python train_dat.py --config-file configs/diverse_weather_c.yaml 
+python train_datac.py --config-file configs/diverse_weather_c.yaml 
 ```
 
 ### Citation
