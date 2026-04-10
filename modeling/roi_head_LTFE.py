@@ -8,6 +8,7 @@ import torchvision.transforms as T
 
 from detectron2.layers import ShapeSpec
 from detectron2.data import MetadataCatalog
+from detectron2.utils.events import get_event_storage
 
 from detectron2.modeling.roi_heads.roi_heads import ROI_HEADS_REGISTRY, Res5ROIHeads
 from detectron2.structures import Boxes, ImageList, Instances, pairwise_iou
@@ -37,6 +38,7 @@ class ClipRes5ROIHeads(Res5ROIHeads):
         super().__init__(cfg, input_shape)
         clsnames = MetadataCatalog.get(cfg.DATASETS.TRAIN[0]).get("thing_classes").copy()
 
+        ##change the labels to represent the objects correctly
         for name in cfg.MODEL.RENAME:
             ind = clsnames.index(name[0])
             clsnames[ind] = name[1]
@@ -47,6 +49,7 @@ class ClipRes5ROIHeads(Res5ROIHeads):
         self.clip_im_predictor = self.box_predictor.cls_score
         self.device = cfg.MODEL.DEVICE
 
+    # 扩展签名支持 features_orig
     def forward(
             self,
             images: ImageList,
@@ -113,6 +116,10 @@ class ClipRes5ROIHeads(Res5ROIHeads):
 class ClipRes5ROIHeadsAttn(ClipRes5ROIHeads):
     def __init__(self, cfg, input_shape) -> None:
         super().__init__(cfg, input_shape)
+        # Conservative defaults: stabilize optimization first, then improve target domain.
+        self.tfam_loss_weight = float(getattr(cfg.MODEL, "TFAM_LOSS_WEIGHT", 0.05))
+        self.tfam_inter_weight = float(getattr(cfg.MODEL, "TFAM_INTER_WEIGHT", 0.05))
+        self.tfam_warmup_iters = int(getattr(cfg.MODEL, "TFAM_WARMUP_ITERS", 1000))
 
     def _shared_roi_transform(self, features, boxes):
         x = self.pooler(features, boxes)
@@ -156,13 +163,14 @@ class ClipRes5ROIHeadsAttn(ClipRes5ROIHeads):
 
         proposal_boxes = [x.proposal_boxes for x in proposals]
 
-
+        # 演化后的特征提取
         box_features = self._shared_roi_transform(
             [features[f] for f in self.in_features], proposal_boxes
         )
 
         attn_feat = backbone.attention_global_pool(box_features)
 
+        # 处理池化
         if hasattr(attn_feat, 'shape') and len(attn_feat.shape) > 2:
             attn_feat_pooled = attn_feat.mean(dim=(2, 3))
         else:
@@ -179,7 +187,10 @@ class ClipRes5ROIHeadsAttn(ClipRes5ROIHeads):
             del features
             losses = self.box_predictor.losses(predictions, proposals)
 
-
+            # =========================================================================
+            # TFAM (Temporal Feature Alignment Module) 损失计算
+            # 作用: 保持源域与生成演化域之间的实例特征语义一致性
+            # =========================================================================
             if features_orig is not None:
                 with torch.no_grad():
                     box_features_orig = self._shared_roi_transform(
@@ -194,6 +205,7 @@ class ClipRes5ROIHeadsAttn(ClipRes5ROIHeads):
                 P_hat = attn_feat_pooled
 
                 labels = torch.cat([p.gt_classes for p in proposals], dim=0)
+                # 忽略背景 Proposals 的对齐（只关注真实前景实体对齐）
                 valid_mask = (labels >= 0) & (labels != self.num_classes)
 
                 if valid_mask.sum() > 0:
@@ -201,28 +213,43 @@ class ClipRes5ROIHeadsAttn(ClipRes5ROIHeads):
                     P_hat_v = P_hat[valid_mask]
                     labels_v = labels[valid_mask]
 
+                    P_in_norm = F.normalize(P_in_v, p=2, dim=1)
+                    P_hat_norm = F.normalize(P_hat_v, p=2, dim=1)
 
-                    L_intra = F.mse_loss(P_in_v, P_hat_v)
+                    # 1. Intra-class Consistency Loss
+                    L_intra = F.mse_loss(P_in_norm, P_hat_norm)
 
                     # 2. Inter-class Separability Loss
                     P_in_norm = F.normalize(P_in_v, p=2, dim=1)
                     P_hat_norm = F.normalize(P_hat_v, p=2, dim=1)
-                    sim_matrix = torch.matmul(P_in_norm, P_hat_norm.t())  # Cosine similarity
+                    # sim_matrix = torch.matmul(P_in_norm, P_hat_norm.t())  # Cosine similarity
 
-                    sim_ii = torch.diag(sim_matrix)
-                    num = torch.exp(sim_ii)
+                    temperature = 0.1
+                    sim_matrix = torch.matmul(P_in_norm, P_hat_norm.t()) / temperature
 
-
+                    # 仅求不同 Class 之间的距离差异
                     labels_i = labels_v.unsqueeze(1)
                     labels_j = labels_v.unsqueeze(0)
-                    mask_diff_cls = (labels_i != labels_j).float()
+                    mask_diff_cls = (labels_i != labels_j)
 
-                    den = (torch.exp(sim_matrix) * mask_diff_cls).sum(dim=1) + 1e-8
+                    # Numerically stable inter-class contrastive term.
+                    pos_logit = torch.diag(sim_matrix)
+                    neg_logits = sim_matrix.masked_fill(~mask_diff_cls, float("-inf"))
+                    has_neg = mask_diff_cls.any(dim=1)
+                    if has_neg.any():
+                        neg_lse = torch.logsumexp(neg_logits[has_neg], dim=1)
+                        L_inter = F.softplus(neg_lse - pos_logit[has_neg]).mean()
+                    else:
+                        L_inter = pos_logit.new_zeros(())
 
-                    L_inter = -torch.log(num / (num + den)).mean()
-
-
-                    loss_align = 1.0 * L_intra + 0.1 * L_inter
+                    # TFAM 全局对齐总损失，权重依论文配置 lambda1=1.0, lambda2=0.1
+                    loss_align = 1.0 * L_intra + self.tfam_inter_weight * L_inter
+                    if self.tfam_warmup_iters > 0:
+                        cur_iter = get_event_storage().iter
+                        warmup_scale = min(1.0, float(cur_iter) / float(self.tfam_warmup_iters))
+                    else:
+                        warmup_scale = 1.0
+                    loss_align = loss_align * self.tfam_loss_weight * warmup_scale
                     losses["loss_align"] = loss_align
             # =========================================================================
 
@@ -239,6 +266,5 @@ class ClipRes5ROIHeadsAttn(ClipRes5ROIHeads):
             return [], losses
         else:
             pred_instances, _ = self.box_predictor.inference(predictions, proposals)
-            pred_instances = self.forward_with_given_boxes(features_orig if features_orig is not None else features,
-                                                           pred_instances)
+            pred_instances = self.forward_with_given_boxes(features, pred_instances)
             return pred_instances, {}
